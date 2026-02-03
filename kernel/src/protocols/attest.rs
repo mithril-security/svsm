@@ -19,7 +19,7 @@ use crate::mm::guestmem::{copy_slice_to_guest, read_bytes_from_guest, read_from_
 use crate::protocols::{errors::SvsmReqError, RequestParams};
 use crate::utils::MemoryRegion;
 #[cfg(all(feature = "vtpm", not(test)))]
-use crate::vtpm::vtpm_get_manifest;
+use crate::vtpm::vtpm_get_akpub;
 
 use alloc::{boxed::Box, vec::Vec};
 use uuid::{uuid, Uuid};
@@ -337,7 +337,7 @@ fn attest_single_vtpm(
     params: &mut RequestParams,
     ops: &AttestSingleServiceOp,
 ) -> Result<(), SvsmReqError> {
-    attest_single_service(vtpm_get_manifest()?.as_slice(), params, ops)
+    attest_single_service(vtpm_get_akpub()?.as_slice(), params, ops)
 }
 
 fn attest_multiple_services(params: &mut RequestParams) -> Result<(), SvsmReqError> {
@@ -353,7 +353,7 @@ fn attest_multiple_services(params: &mut RequestParams) -> Result<(), SvsmReqErr
     let mut services = GuidTable::new();
 
     #[cfg(all(feature = "vtpm", not(test)))]
-    services.push(SVSM_ATTEST_VTPM_GUID, vtpm_get_manifest()?);
+    services.push(SVSM_ATTEST_VTPM_GUID, vtpm_get_akpub()?);
 
     let manifest = services.to_vec()?;
     let mut nonce_and_manifest = attest_op.get_nonce()?;

@@ -93,6 +93,28 @@ pub trait VtpmInterface: TcgTpmSimulatorInterface {
     /// that the EK public key does not exist.
     /// Needs mutability to cache the key.
     fn get_ekpub(&mut self) -> Result<Vec<u8>, SvsmReqError>;
+
+    /// Create RSA 2048 Endorsement Key (EK) and cache the public key
+    ///
+    /// This function creates an RSA 2048-bit Endorsement Key (EK) from the TPM's Endorsement
+    /// Primary Seed (EPS) and caches the public key as TMPT_PUBLIC structure. The cached EK
+    /// public key can be retrieved later and used to  provide  vTPM service attestation. The
+    /// EK is created with the TCG default EK template as shown in Table 4 of the "TCG EK
+    /// Credential Profile For TPM Family 2.0; Level 0 Version 2.5 Revision 2.0".
+    ///
+    /// Since the EK is created from the EPS, following the TCG EK Credential Profile, the EK can
+    /// be recreated at any time. For example, one can recreate the same EK in an OS using TSS2
+    /// "tpm2_createek -c ek.ctx -G rsa -u ek.pub command".
+    ///
+    /// Retrieve the EK public key with get_ekpub() function.
+    /// Creates and generates the Attestation Key, returns an error if the key has an issue
+    fn get_akpub(&mut self) -> Result<Vec<u8>, SvsmReqError>;
+
+    /// Run the TPM self-test command
+    fn run_selftest_cmd(&self) -> Result<(), SvsmReqError>;
+
+    // Run the TPM startup command
+    fn run_startup_cmd(&self) -> Result<(), SvsmReqError>;
 }
 
 static VTPM: SpinLock<Vtpm> = SpinLock::new(Vtpm::new());
@@ -117,4 +139,11 @@ pub fn vtpm_get_locked<'a>() -> LockGuard<'a, Vtpm> {
 pub fn vtpm_get_manifest() -> Result<Vec<u8>, SvsmReqError> {
     let mut vtpm = VTPM.lock();
     vtpm.get_ekpub()
+}
+
+/// Get the TPM AK public key
+/// This key will be used to verify the signature of the quote
+pub fn vtpm_get_akpub() -> Result<Vec<u8>, SvsmReqError> {
+    let mut vtpm = VTPM.lock();
+    vtpm.get_akpub()
 }

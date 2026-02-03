@@ -12,6 +12,7 @@
 mod wrapper;
 
 pub mod ek_templates;
+pub mod ak_templates;
 mod tss;
 
 extern crate alloc;
@@ -29,22 +30,28 @@ use crate::{
     protocols::{errors::SvsmReqError, vtpm::TpmPlatformCommand},
     types::PAGE_SIZE,
     vtpm::{
-        tcgtpm::ek_templates::DEFAULT_PUBLIC_AREA, TcgTpmSimulatorInterface, VtpmInterface,
-        VtpmProtocolInterface,
+        tcgtpm::ek_templates::DEFAULT_PUBLIC_AREA, tcgtpm::ak_templates::PUBLIC_AREA_AK, TcgTpmSimulatorInterface, VtpmInterface,
+        VtpmProtocolInterface, tcgtpm::tss::{EK,AK}
     },
 };
+
+// Definitions from "Trusted Platform Module Library Part 4: Supporting Routines – Code,
+// Family “2.0”, Level 00, Revision 01.38"
+const TPM_AK_HANDLE: u32 = 0x81000002;
 
 #[derive(Debug, Clone, Default)]
 pub struct TcgTpm {
     is_powered_on: bool,
-    ekpub: Option<Vec<u8>>,
+    ek: Option<EK>,
+    ak: Option<AK>,
 }
 
 impl TcgTpm {
     pub const fn new() -> TcgTpm {
         TcgTpm {
             is_powered_on: false,
-            ekpub: None,
+            ek: None,
+            ak: None
         }
     }
 
@@ -165,11 +172,38 @@ impl TcgTpmSimulatorInterface for TcgTpm {
 }
 
 impl VtpmInterface for TcgTpm {
-    fn get_ekpub(&mut self) -> Result<Vec<u8>, SvsmReqError> {
-        if self.ekpub.is_none() {
-            self.ekpub = Some(tss::create_ek(self, &DEFAULT_PUBLIC_AREA[..])?);
+    fn run_selftest_cmd(&self) -> Result<(), SvsmReqError> {
+        // TPM2_CC_SelfTest
+        let selftest_cmd: &mut [u8] = &mut [
+            0x80, 0x01, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x01, 0x43, 0x00,
+        ];
+        self.send_tpm_command(selftest_cmd, 0)?;
+
+        Ok(())
+    }
+
+    fn run_startup_cmd(&self) -> Result<(), SvsmReqError> {
+        // TPM2_CC_Startup
+        let startup_cmd: &mut [u8] = &mut [
+            0x80, 0x01, 0x00, 0x00, 0x00, 0x0c, 0x00, 0x00, 0x01, 0x44, 0x00, 0x00,
+        ];
+        self.send_tpm_command(startup_cmd, 0)?;
+
+        Ok(())
+    }
+
+    fn get_akpub(&mut self) -> Result<Vec<u8>, SvsmReqError> {
+        if self.ak.is_none() {
+            self.ak = Some(tss::create_ak(self, &PUBLIC_AREA_AK[..])?);
         }
-        self.ekpub.clone().ok_or_else(SvsmReqError::invalid_request)
+        self.ak.clone().map(|ak| ak.akpub).ok_or_else(SvsmReqError::invalid_request)
+    }
+
+    fn get_ekpub(&mut self) -> Result<Vec<u8>, SvsmReqError> {
+        if self.ek.is_none() {
+            self.ek = Some(tss::create_ek(self, &DEFAULT_PUBLIC_AREA[..])?);
+        }
+        self.ek.clone().map(|ek| ek.ekpub).ok_or_else(SvsmReqError::invalid_request)
     }
 
     fn is_powered_on(&self) -> bool {
@@ -177,7 +211,7 @@ impl VtpmInterface for TcgTpm {
     }
 
     fn init(&mut self) -> Result<(), SvsmReqError> {
-        // Initialize the TPM TCG following the same steps done in the Simulator:
+        // Initialize the TPM TCG following the same steps done in the Simulator and generate EK:
         //
         // 1. Manufacture it for the first time
         // 2. Make sure it does not fail if it is re-manufactured
@@ -185,7 +219,14 @@ impl VtpmInterface for TcgTpm {
         // 4. Manufacture it for the first time
         // 5. Power it on indicating it requires startup. By default, OVMF will start
         //    and selftest it.
-
+        // 6. Selftest it
+        // 7. Start it up  on for next step
+        // 8. Create RSA2004 EK and cache EKpub for VTPM service attestation requests
+        //
+        // Since we have already run TPM2_Startup here, when OVMF runs TPM2_Startup, it will
+        // get back TPM_RC_INITIALIZE indicating that TPM2_Startup is not required. See,
+        // https://github.com/tianocore/edk2/blob/master/SecurityPkg/Library/Tpm2CommandLib/Tpm2Startup.c#L75
+        log::info!("VTPM: Init");
         // SAFETY: FFI call. Parameters and return values are checked.
         let mut rc = unsafe { _plat__NVEnable(VirtAddr::null().as_mut_ptr::<c_void>(), 0) };
         if rc != 0 {
@@ -214,8 +255,27 @@ impl VtpmInterface for TcgTpm {
         self.signal_poweron(false)?;
         self.signal_nvon()?;
 
+        self.run_selftest_cmd()?;
+        log::info!("run_startup_cmd");
+        self.run_startup_cmd()?;
+
+        // `tpm2_createek -c ek.handle -G rsa -u ek.pub`                                                                    
+        self.ek = Some(tss::create_ek(self, &DEFAULT_PUBLIC_AREA[..])?);
+
+        // `tpm2_createprimary -C o -g sha256 -G ecc:ecdsa -c ak.ctx -a 'fixedtpm|fixedparent|sensitivedataorigin|userwithauth|noda|sign'`
+        self.ak = Some(tss::create_ak(self, &PUBLIC_AREA_AK[..])?);
+
+        // `tpm2_evictcontrol -C o -c ak.ctx $TPM_AK_HANDLE`
+        // We can safely unwrap, as a None vaue would have already panicked.
+        tss::evict_control(self, self.ak.clone().unwrap().akhandle, &TPM_AK_HANDLE.to_be_bytes()[..])?;
+       
+        // Verify the key is there with `tpm2_readpublic -c $TPM_AK_HANDLE -o ak.pub -f pem`
+
+        log::info!("VTPM: AK created.");
+
         log::info!("VTPM: TPM 2.0 Reference Implementation initialized");
 
         Ok(())
     }
 }
+
